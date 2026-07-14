@@ -1,9 +1,9 @@
-# import_dataco.py
+# dataco_pipeline.py
 #
 # Purpose: Download the raw "DataCo Smart Supply Chain for Big Data Analysis"
-# dataset (Kaggle) via kagglehub, load it into a pandas DataFrame, and run a
-# first-pass data-quality inspection. This is a STARTING POINT for your
-# cleaning pipeline, not the final cleaned dataset.
+# dataset (Kaggle) via kagglehub, load it into a pandas DataFrame, run a
+# first-pass data-quality inspection, then clean it and export a cleaned CSV
+# ready for analysis/dashboarding.
 #
 # Dataset source:
 # https://www.kaggle.com/datasets/shashwatwork/dataco-smart-supply-chain-for-big-data-analysis
@@ -24,8 +24,23 @@
 #   3. Date columns are strings like "1/31/2018 22:56" (M/D/YYYY H:MM),
 #      not proper datetime objects until you parse them.
 #
+# Cleaning rules applied:
+#   1. Text/categorical missing values (Customer Lname, Product Description,
+#      etc.) are left as NaN -- not filled with a placeholder.
+#   2. Missing numeric values are left as NaN -- never imputed with 0 or a
+#      mean -- so they don't silently skew averages/sums downstream.
+#   3. Zipcode columns (Customer Zipcode, Order Zipcode) are kept as
+#      zero-padded strings, not numbers -- they're identifiers, and
+#      averaging/summing a zipcode is meaningless. Missing zipcodes stay
+#      null (pd.NA).
+#   4. Date columns ("order date (DateOrders)", "shipping date (DateOrders)")
+#      are parsed from "M/D/YYYY H:MM" strings into real datetime64 values.
+#      Anything that fails to parse becomes NaT (pandas' null for dates)
+#      rather than being silently dropped or left as a string.
+#   5. Exact duplicate rows are dropped.
+#
 # Run:
-#   python import_dataco.py
+#   python dataco_pipeline.py
 
 import os
 import glob
@@ -111,6 +126,78 @@ def quick_kpi_preview(df: pd.DataFrame) -> None:
         print(df["Delivery Status"].value_counts().to_string())
 
 
+def strip_whitespace(df: pd.DataFrame) -> pd.DataFrame:
+    """Trim leading/trailing whitespace on all text columns."""
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].str.strip()
+    return df
+
+
+def parse_date_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert columns like 'order date (DateOrders)' from 'M/D/YYYY H:MM' strings to datetime64."""
+    date_cols = [c for c in df.columns if "date" in c.lower()]
+    for col in date_cols:
+        before_missing = df[col].isnull().sum()
+        df[col] = pd.to_datetime(df[col], format="%m/%d/%Y %H:%M", errors="coerce")
+        newly_unparseable = df[col].isnull().sum() - before_missing
+        if newly_unparseable > 0:
+            print(
+                f"  WARNING: {newly_unparseable} values in '{col}' didn't match "
+                f"the expected 'M/D/YYYY H:MM' format and were set to NaT."
+            )
+    return df
+
+
+def clean_zipcodes(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep zipcode columns as zero-padded strings; they're identifiers, not quantities."""
+    zip_cols = [c for c in df.columns if "zipcode" in c.lower()]
+    for col in zip_cols:
+        df[col] = df[col].apply(lambda v: str(int(v)).zfill(5) if pd.notnull(v) else pd.NA)
+    return df
+
+
+def drop_duplicate_rows(df: pd.DataFrame) -> pd.DataFrame:
+    before = len(df)
+    df = df.drop_duplicates()
+    print(f"  Dropped {before - len(df):,} fully duplicated rows.")
+    return df
+
+
+def report_missing_after(df: pd.DataFrame) -> None:
+    print("\n=== Missing Values After Cleaning ===")
+    missing = df.isnull().sum()
+    missing = missing[missing > 0].sort_values(ascending=False)
+    if missing.empty:
+        print("  None.")
+        return
+    pct = (missing / len(df) * 100).round(2)
+    print(pd.DataFrame({"missing_count": missing, "missing_pct": pct}).to_string())
+
+
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    print("Stripping whitespace from text columns...")
+    df = strip_whitespace(df)
+
+    print("Parsing date columns...")
+    df = parse_date_columns(df)
+
+    print("Normalizing zipcode columns to zero-padded strings...")
+    df = clean_zipcodes(df)
+
+    print("Removing duplicate rows...")
+    df = drop_duplicate_rows(df)
+
+    # Numeric columns are left untouched here on purpose: pandas already
+    # reads missing numeric cells as NaN, and NaN is excluded from
+    # .mean()/.sum() by default, so no imputation step is needed or wanted.
+
+    report_missing_after(df)
+
+    return df
+
+
 def main() -> None:
     try:
         folder = download_dataset()
@@ -131,18 +218,21 @@ def main() -> None:
             )
             sys.exit(1)
 
-    df = load_raw_data(csv_path)
+    raw_df = load_raw_data(csv_path)
 
-    report_columns(df)
-    preview_rows(df)
-    report_missing_values(df)
-    report_duplicates(df)
-    quick_kpi_preview(df)
+    report_columns(raw_df)
+    preview_rows(raw_df)
+    report_missing_values(raw_df)
+    report_duplicates(raw_df)
+    quick_kpi_preview(raw_df)
 
+    cleaned_df = clean(raw_df)
+
+    out_path = "DataCoSupplyChain_cleaned.csv"
+    cleaned_df.to_csv(out_path, index=False)
     print(
-        "\nDone. Next steps: clean/convert date columns to datetime, drop or "
-        "impute the high-missing columns, and export a cleaned CSV for your "
-        "dashboard (e.g. df.to_csv('DataCoSupplyChain_cleaned.csv', index=False))."
+        f"\nDone. Cleaned data written to '{out_path}' "
+        f"({len(cleaned_df):,} rows, {len(cleaned_df.columns)} columns)."
     )
 
 
