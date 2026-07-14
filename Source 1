@@ -1,1 +1,150 @@
+# import_dataco.py
+#
+# Purpose: Download the raw "DataCo Smart Supply Chain for Big Data Analysis"
+# dataset (Kaggle) via kagglehub, load it into a pandas DataFrame, and run a
+# first-pass data-quality inspection. This is a STARTING POINT for your
+# cleaning pipeline, not the final cleaned dataset.
+#
+# Dataset source:
+# https://www.kaggle.com/datasets/shashwatwork/dataco-smart-supply-chain-for-big-data-analysis
+#
+# Requirements:
+#   pip install kagglehub pandas
+#
+# You'll also need a Kaggle account with API credentials configured
+# (~/.kaggle/kaggle.json), or kagglehub will prompt you to authenticate
+# the first time you run this.
+#
+# Known quirks of the raw file this script accounts for:
+#   1. The file is encoded in Latin-1 (ISO-8859-1), NOT UTF-8. Reading it
+#      as UTF-8 will throw a UnicodeDecodeError or silently mangle accented
+#      characters in product/customer name fields.
+#   2. Several columns contain missing values: Customer Lname,
+#      Customer Zipcode, Order Zipcode, Product Description.
+#   3. Date columns are strings like "1/31/2018 22:56" (M/D/YYYY H:MM),
+#      not proper datetime objects until you parse them.
+#
+# Run:
+#   python import_dataco.py
 
+import os
+import glob
+import sys
+
+import pandas as pd
+import kagglehub
+
+
+def download_dataset() -> str:
+    """Download the dataset via kagglehub and return the local folder path."""
+    print("Downloading dataset via kagglehub ...")
+    path = kagglehub.dataset_download(
+        "shashwatwork/dataco-smart-supply-chain-for-big-data-analysis"
+    )
+    print(f"Path to dataset files: {path}")
+    return path
+
+
+def find_csv(folder: str) -> str:
+    """kagglehub returns a directory, not a direct file path -- find the CSV inside it."""
+    matches = glob.glob(os.path.join(folder, "**", "*.csv"), recursive=True)
+    if not matches:
+        raise FileNotFoundError(f"No CSV file found under '{folder}'.")
+    return matches[0]
+
+
+def load_raw_data(csv_path: str) -> pd.DataFrame:
+    """Load the raw CSV, handling the Latin-1 encoding quirk."""
+    print(f"\nLoading {csv_path} ...")
+    # encoding='latin1' avoids UnicodeDecodeError on accented characters
+    # in Customer/Product name fields. low_memory=False avoids pandas'
+    # mixed-dtype warning on a file this wide (53 columns).
+    df = pd.read_csv(csv_path, encoding="latin1", low_memory=False)
+    print(f"Loaded {len(df):,} rows, {len(df.columns)} columns.")
+    return df
+
+
+def report_columns(df: pd.DataFrame) -> None:
+    print("\n=== Columns Detected ===")
+    for i, col in enumerate(df.columns):
+        print(f"  [{i}] {col}  (dtype: {df[col].dtype})")
+
+
+def preview_rows(df: pd.DataFrame, n: int = 5) -> None:
+    print(f"\n=== First {n} Rows (raw) ===")
+    with pd.option_context("display.max_columns", None, "display.width", 150):
+        print(df.head(n))
+
+
+def report_missing_values(df: pd.DataFrame) -> None:
+    print("\n=== Missing / Empty Value Report ===")
+    missing = df.isnull().sum()
+    missing = missing[missing > 0].sort_values(ascending=False)
+
+    if missing.empty:
+        print("  No missing values detected (unlikely for this dataset -- double-check encoding).")
+        return
+
+    pct = (missing / len(df) * 100).round(2)
+    report = pd.DataFrame({"missing_count": missing, "missing_pct": pct})
+    print(report.to_string())
+
+
+def report_duplicates(df: pd.DataFrame) -> None:
+    dup_count = df.duplicated().sum()
+    print(f"\n=== Duplicate Rows ===\n  {dup_count:,} fully duplicated rows found.")
+
+
+def quick_kpi_preview(df: pd.DataFrame) -> None:
+    print("\n=== Quick KPI Preview ===")
+
+    if "Late_delivery_risk" in df.columns:
+        late_rate = df["Late_delivery_risk"].mean() * 100
+        print(f"  Late delivery rate: {late_rate:.2f}%")
+
+    if "Shipping Mode" in df.columns:
+        print("  Shipping mode breakdown:")
+        print(df["Shipping Mode"].value_counts().to_string())
+
+    if "Delivery Status" in df.columns:
+        print("\n  Delivery status breakdown:")
+        print(df["Delivery Status"].value_counts().to_string())
+
+
+def main() -> None:
+    try:
+        folder = download_dataset()
+        csv_path = find_csv(folder)
+    except Exception as e:
+        # Fall back to a local file if the download step fails, e.g. no
+        # Kaggle credentials configured yet.
+        print(f"\nWARNING: auto-download failed ({e}).")
+        fallback = "DataCoSupplyChainDataset.csv"
+        if os.path.exists(fallback):
+            print(f"Falling back to local file: {fallback}")
+            csv_path = fallback
+        else:
+            print(
+                "No local fallback file found either. Download the dataset "
+                "manually from Kaggle and place it next to this script as "
+                f"'{fallback}', or fix your kagglehub credentials."
+            )
+            sys.exit(1)
+
+    df = load_raw_data(csv_path)
+
+    report_columns(df)
+    preview_rows(df)
+    report_missing_values(df)
+    report_duplicates(df)
+    quick_kpi_preview(df)
+
+    print(
+        "\nDone. Next steps: clean/convert date columns to datetime, drop or "
+        "impute the high-missing columns, and export a cleaned CSV for your "
+        "dashboard (e.g. df.to_csv('DataCoSupplyChain_cleaned.csv', index=False))."
+    )
+
+
+if __name__ == "__main__":
+    main()
