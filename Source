@@ -1,0 +1,571 @@
+# dataco_full.py
+#
+# Purpose: End-to-end pipeline for the "DataCo Smart Supply Chain for Big
+# Data Analysis" dataset (Kaggle). Downloads the raw data via kagglehub,
+# loads it into a pandas DataFrame, runs a first-pass data-quality
+# inspection, cleans it, exports a cleaned CSV, and then answers the key
+# shareholder-facing questions with one chart per question.
+#
+# Dataset source:
+# https://www.kaggle.com/datasets/shashwatwork/dataco-smart-supply-chain-for-big-data-analysis
+#
+# Requirements (every package used anywhere in this file):
+#   pip install pandas numpy matplotlib seaborn plotly kagglehub
+#   pip install -U kaleido   # optional, only needed to export the map as a static PNG
+#
+# You'll also need a Kaggle account with API credentials configured
+# (~/.kaggle/kaggle.json), or kagglehub will prompt you to authenticate
+# the first time you run this.
+#
+# Known quirks of the raw file this script accounts for:
+#   1. The file is encoded in Latin-1 (ISO-8859-1), NOT UTF-8. Reading it
+#      as UTF-8 will throw a UnicodeDecodeError or silently mangle accented
+#      characters in product/customer name fields.
+#   2. Several columns contain missing values: Customer Lname,
+#      Customer Zipcode, Order Zipcode, Product Description.
+#   3. Date columns are strings like "1/31/2018 22:56" (M/D/YYYY H:MM),
+#      not proper datetime objects until you parse them.
+#
+# Cleaning rules applied:
+#   1. Text/categorical missing values (Customer Lname, Product Description,
+#      etc.) are left as NaN -- not filled with a placeholder.
+#   2. Missing numeric values are left as NaN -- never imputed with 0 or a
+#      mean -- so they don't silently skew averages/sums downstream.
+#   3. Zipcode columns (Customer Zipcode, Order Zipcode) are kept as
+#      zero-padded strings, not numbers -- they're identifiers, and
+#      averaging/summing a zipcode is meaningless. Missing zipcodes stay
+#      null (pd.NA).
+#   4. Date columns ("order date (DateOrders)", "shipping date (DateOrders)")
+#      are parsed from "M/D/YYYY H:MM" strings into real datetime64 values.
+#      Anything that fails to parse becomes NaT (pandas' null for dates)
+#      rather than being silently dropped or left as a string.
+#   5. Exact duplicate rows are dropped.
+#
+# Questions answered (one analysis function per question):
+#   1. Which shipping mode / region / market has the highest late-delivery
+#      rate?                                   -> bar chart
+#   2. Which shipping mode takes longer than scheduled, on average?
+#                                                -> grouped bar chart
+#   3. Which category drives the most profit vs. the most revenue?
+#                                                -> ranked horizontal bar chart
+#   4. Are discounts eroding profit?             -> scatter plot + trendline
+#   5. Which shipping mode has the worst delivery-status mix?
+#                                                -> heatmap
+#   6. Which customer segment is most profitable, and at what
+#      delivery-risk cost?                       -> bubble chart
+#   7. Which countries/regions generate the most sales?
+#                                                -> choropleth map (plotly)
+#   8. Is revenue/profit growing, flat, or declining over time?
+#                                                -> dual-axis time series
+#   9. Where are the loss-making orders concentrated?
+#                                                -> ranked horizontal bar chart
+#
+# Run:
+#   python dataco_full.py
+#
+# Output:
+#   Printed data-quality report and plain-English answers to each question,
+#   a cleaned CSV (DataCoSupplyChain_cleaned.csv), and one chart per
+#   question saved under ./figures/ (PNG, except the map which is also
+#   saved as an interactive HTML file).
+
+import os
+import glob
+import sys
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+import kagglehub
+
+
+def download_dataset() -> str:
+    """Download the dataset via kagglehub and return the local folder path."""
+    print("Downloading dataset via kagglehub ...")
+    path = kagglehub.dataset_download(
+        "shashwatwork/dataco-smart-supply-chain-for-big-data-analysis"
+    )
+    print(f"Path to dataset files: {path}")
+    return path
+
+
+def find_csv(folder: str) -> str:
+    """kagglehub returns a directory, not a direct file path -- find the CSV inside it."""
+    matches = glob.glob(os.path.join(folder, "**", "*.csv"), recursive=True)
+    if not matches:
+        raise FileNotFoundError(f"No CSV file found under '{folder}'.")
+    return matches[0]
+
+
+def load_raw_data(csv_path: str) -> pd.DataFrame:
+    """Load the raw CSV, handling the Latin-1 encoding quirk."""
+    print(f"\nLoading {csv_path} ...")
+    # encoding='latin1' avoids UnicodeDecodeError on accented characters
+    # in Customer/Product name fields. low_memory=False avoids pandas'
+    # mixed-dtype warning on a file this wide (53 columns).
+    df = pd.read_csv(csv_path, encoding="latin1", low_memory=False)
+    print(f"Loaded {len(df):,} rows, {len(df.columns)} columns.")
+    return df
+
+
+def report_columns(df: pd.DataFrame) -> None:
+    print("\n=== Columns Detected ===")
+    for i, col in enumerate(df.columns):
+        print(f"  [{i}] {col}  (dtype: {df[col].dtype})")
+
+
+def preview_rows(df: pd.DataFrame, n: int = 5) -> None:
+    print(f"\n=== First {n} Rows (raw) ===")
+    with pd.option_context("display.max_columns", None, "display.width", 150):
+        print(df.head(n))
+
+
+def report_missing_values(df: pd.DataFrame) -> None:
+    print("\n=== Missing / Empty Value Report ===")
+    missing = df.isnull().sum()
+    missing = missing[missing > 0].sort_values(ascending=False)
+
+    if missing.empty:
+        print("  No missing values detected (unlikely for this dataset -- double-check encoding).")
+        return
+
+    pct = (missing / len(df) * 100).round(2)
+    report = pd.DataFrame({"missing_count": missing, "missing_pct": pct})
+    print(report.to_string())
+
+
+def report_duplicates(df: pd.DataFrame) -> None:
+    dup_count = df.duplicated().sum()
+    print(f"\n=== Duplicate Rows ===\n  {dup_count:,} fully duplicated rows found.")
+
+
+def quick_kpi_preview(df: pd.DataFrame) -> None:
+    print("\n=== Quick KPI Preview ===")
+
+    if "Late_delivery_risk" in df.columns:
+        late_rate = df["Late_delivery_risk"].mean() * 100
+        print(f"  Late delivery rate: {late_rate:.2f}%")
+
+    if "Shipping Mode" in df.columns:
+        print("  Shipping mode breakdown:")
+        print(df["Shipping Mode"].value_counts().to_string())
+
+    if "Delivery Status" in df.columns:
+        print("\n  Delivery status breakdown:")
+        print(df["Delivery Status"].value_counts().to_string())
+
+
+def strip_whitespace(df: pd.DataFrame) -> pd.DataFrame:
+    """Trim leading/trailing whitespace on all text columns."""
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].str.strip()
+    return df
+
+
+def parse_date_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert columns like 'order date (DateOrders)' from 'M/D/YYYY H:MM' strings to datetime64."""
+    date_cols = [c for c in df.columns if "date" in c.lower()]
+    for col in date_cols:
+        before_missing = df[col].isnull().sum()
+        df[col] = pd.to_datetime(df[col], format="%m/%d/%Y %H:%M", errors="coerce")
+        newly_unparseable = df[col].isnull().sum() - before_missing
+        if newly_unparseable > 0:
+            print(
+                f"  WARNING: {newly_unparseable} values in '{col}' didn't match "
+                f"the expected 'M/D/YYYY H:MM' format and were set to NaT."
+            )
+    return df
+
+
+def clean_zipcodes(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep zipcode columns as zero-padded strings; they're identifiers, not quantities."""
+    zip_cols = [c for c in df.columns if "zipcode" in c.lower()]
+    for col in zip_cols:
+        df[col] = df[col].apply(lambda v: str(int(v)).zfill(5) if pd.notnull(v) else pd.NA)
+    return df
+
+
+def drop_duplicate_rows(df: pd.DataFrame) -> pd.DataFrame:
+    before = len(df)
+    df = df.drop_duplicates()
+    print(f"  Dropped {before - len(df):,} fully duplicated rows.")
+    return df
+
+
+def report_missing_after(df: pd.DataFrame) -> None:
+    print("\n=== Missing Values After Cleaning ===")
+    missing = df.isnull().sum()
+    missing = missing[missing > 0].sort_values(ascending=False)
+    if missing.empty:
+        print("  None.")
+        return
+    pct = (missing / len(df) * 100).round(2)
+    print(pd.DataFrame({"missing_count": missing, "missing_pct": pct}).to_string())
+
+
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    print("Stripping whitespace from text columns...")
+    df = strip_whitespace(df)
+
+    print("Parsing date columns...")
+    df = parse_date_columns(df)
+
+    print("Normalizing zipcode columns to zero-padded strings...")
+    df = clean_zipcodes(df)
+
+    print("Removing duplicate rows...")
+    df = drop_duplicate_rows(df)
+
+    # Numeric columns are left untouched here on purpose: pandas already
+    # reads missing numeric cells as NaN, and NaN is excluded from
+    # .mean()/.sum() by default, so no imputation step is needed or wanted.
+
+    report_missing_after(df)
+
+    return df
+
+
+def first_present(df: pd.DataFrame, candidates: list):
+    """Return the first column name from `candidates` that actually exists in df."""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def save(fig, figures_dir: str, filename: str) -> None:
+    path = os.path.join(figures_dir, filename)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved chart: {path}")
+
+
+def get_cleaned_data(cleaned_path: str = "DataCoSupplyChain_cleaned.csv") -> pd.DataFrame:
+    """Load the cleaned CSV if it's already been built; otherwise download, inspect, and clean the raw data first."""
+    if os.path.exists(cleaned_path):
+        # Re-detect date/zipcode columns from the header so they round-trip
+        # correctly -- plain read_csv would otherwise turn parsed dates back
+        # into strings and strip the leading zero off zero-padded zipcodes.
+        header = pd.read_csv(cleaned_path, nrows=0)
+        date_cols = [c for c in header.columns if "date" in c.lower()]
+        zip_cols = [c for c in header.columns if "zipcode" in c.lower()]
+        df = pd.read_csv(
+            cleaned_path,
+            parse_dates=date_cols,
+            dtype={c: "string" for c in zip_cols},
+            low_memory=False,
+        )
+        print(f"Loaded cleaned data from '{cleaned_path}' ({len(df):,} rows, {len(df.columns)} columns).")
+        return df
+
+    print(f"'{cleaned_path}' not found -- running the full pipeline to build it first.")
+    try:
+        folder = download_dataset()
+        csv_path = find_csv(folder)
+    except Exception as e:
+        # Fall back to a local file if the download step fails, e.g. no
+        # Kaggle credentials configured yet.
+        print(f"\nWARNING: auto-download failed ({e}).")
+        fallback = "DataCoSupplyChainDataset.csv"
+        if os.path.exists(fallback):
+            print(f"Falling back to local file: {fallback}")
+            csv_path = fallback
+        else:
+            print(
+                "No local fallback file found either. Download the dataset "
+                "manually from Kaggle and place it next to this script as "
+                f"'{fallback}', or fix your kagglehub credentials."
+            )
+            sys.exit(1)
+
+    raw_df = load_raw_data(csv_path)
+
+    report_columns(raw_df)
+    preview_rows(raw_df)
+    report_missing_values(raw_df)
+    report_duplicates(raw_df)
+    quick_kpi_preview(raw_df)
+
+    df = clean(raw_df)
+
+    df.to_csv(cleaned_path, index=False)
+    print(
+        f"\nDone cleaning. Cleaned data written to '{cleaned_path}' "
+        f"({len(df):,} rows, {len(df.columns)} columns)."
+    )
+    return df
+
+
+def analyze_late_delivery_rate(df: pd.DataFrame, figures_dir: str) -> None:
+    if "Late_delivery_risk" not in df.columns:
+        print("Skipping late-delivery analysis: 'Late_delivery_risk' column not found.")
+        return
+    dims = [c for c in ["Shipping Mode", "Order Region", "Market"] if c in df.columns]
+    if not dims:
+        print("Skipping late-delivery analysis: no grouping dimension found.")
+        return
+
+    print("\n=== Q1: Which shipping mode / region / market has the highest late-delivery rate? ===")
+    fig, axes = plt.subplots(1, len(dims), figsize=(6 * len(dims), 5))
+    if len(dims) == 1:
+        axes = [axes]
+
+    for ax, dim in zip(axes, dims):
+        rate = (df.groupby(dim)["Late_delivery_risk"].mean() * 100).sort_values(ascending=False)
+        print(f"  Worst {dim}: {rate.index[0]} ({rate.iloc[0]:.1f}% late)")
+        rate.plot(kind="bar", ax=ax, color="indianred")
+        ax.set_ylabel("Late delivery rate (%)")
+        ax.set_title(f"Late Delivery Rate by {dim}")
+        ax.tick_params(axis="x", rotation=45)
+
+    fig.tight_layout()
+    save(fig, figures_dir, "late_delivery_rate_by_dimension.png")
+
+
+def analyze_shipping_delay(df: pd.DataFrame, figures_dir: str) -> None:
+    real_col, sched_col = "Days for shipping (real)", "Days for shipment (scheduled)"
+    if real_col not in df.columns or sched_col not in df.columns or "Shipping Mode" not in df.columns:
+        print("Skipping shipping-delay analysis: required columns not found.")
+        return
+
+    grouped = df.groupby("Shipping Mode")[[real_col, sched_col]].mean().sort_values(real_col, ascending=False)
+
+    print("\n=== Q2: Which shipping mode takes longer than scheduled, on average? ===")
+    for mode, row in grouped.iterrows():
+        gap = row[real_col] - row[sched_col]
+        print(f"  {mode}: {row[real_col]:.2f} actual days vs {row[sched_col]:.2f} scheduled ({gap:+.2f} day gap)")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    grouped.rename(columns={real_col: "Actual", sched_col: "Scheduled"}).plot(kind="bar", ax=ax)
+    ax.set_ylabel("Average days")
+    ax.set_title("Actual vs Scheduled Shipping Days by Mode")
+    ax.tick_params(axis="x", rotation=20)
+    fig.tight_layout()
+    save(fig, figures_dir, "shipping_delay_by_mode.png")
+
+
+def analyze_category_profitability(df: pd.DataFrame, figures_dir: str) -> None:
+    profit_col = first_present(df, ["Order Profit Per Order", "Benefit per order"])
+    sales_col = first_present(df, ["Sales", "Order Item Total"])
+    if not profit_col or not sales_col or "Category Name" not in df.columns:
+        print("Skipping category profitability analysis: required columns not found.")
+        return
+
+    grouped = df.groupby("Category Name")[[sales_col, profit_col]].sum()
+    top_profit = grouped[profit_col].idxmax()
+    top_sales = grouped[sales_col].idxmax()
+
+    print("\n=== Q3: Which category drives the most profit vs. the most revenue? ===")
+    print(f"  Highest total sales: {top_sales} (${grouped.loc[top_sales, sales_col]:,.0f})")
+    print(f"  Highest total profit: {top_profit} (${grouped.loc[top_profit, profit_col]:,.0f})")
+    if top_sales != top_profit:
+        print("  NOTE: the top-revenue category is NOT the top-profit category.")
+
+    ranked = grouped.sort_values(profit_col, ascending=True)
+    fig, ax = plt.subplots(figsize=(9, max(4, 0.3 * len(ranked))))
+    ax.barh(ranked.index, ranked[profit_col], color="seagreen")
+    ax.set_xlabel("Total Profit ($)")
+    ax.set_title("Total Profit by Product Category")
+    fig.tight_layout()
+    save(fig, figures_dir, "profit_by_category.png")
+
+
+def analyze_discount_vs_profit(df: pd.DataFrame, figures_dir: str) -> None:
+    discount_col = "Order Item Discount Rate"
+    profit_col = first_present(df, ["Order Profit Per Order", "Benefit per order"])
+    if discount_col not in df.columns or not profit_col:
+        print("Skipping discount-vs-profit analysis: required columns not found.")
+        return
+
+    valid = df[[discount_col, profit_col]].dropna()
+    corr = valid[discount_col].corr(valid[profit_col])
+
+    print("\n=== Q4: Are discounts eroding profit? ===")
+    print(f"  Correlation between discount rate and per-order profit: {corr:.3f}")
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sample = valid.sample(min(5000, len(valid)), random_state=0)  # avoid overplotting on 100k+ rows
+    ax.scatter(sample[discount_col], sample[profit_col], alpha=0.2, s=10)
+
+    z = np.polyfit(valid[discount_col], valid[profit_col], 1)
+    xs = np.linspace(valid[discount_col].min(), valid[discount_col].max(), 100)
+    ax.plot(xs, np.poly1d(z)(xs), color="red", linewidth=2)
+
+    ax.set_xlabel("Order Item Discount Rate")
+    ax.set_ylabel("Profit per Order ($)")
+    ax.set_title(f"Discount Rate vs Profit (corr = {corr:.2f})")
+    fig.tight_layout()
+    save(fig, figures_dir, "discount_vs_profit_scatter.png")
+
+
+def analyze_mode_status_heatmap(df: pd.DataFrame, figures_dir: str) -> None:
+    if "Shipping Mode" not in df.columns or "Delivery Status" not in df.columns:
+        print("Skipping shipping-mode/status heatmap: required columns not found.")
+        return
+
+    cross = pd.crosstab(df["Shipping Mode"], df["Delivery Status"], normalize="index") * 100
+
+    print("\n=== Q5: Which shipping mode has the worst delivery-status mix? ===")
+    if "Late delivery" in cross.columns:
+        worst_mode = cross["Late delivery"].idxmax()
+        print(f"  Highest 'Late delivery' share: {worst_mode} ({cross.loc[worst_mode, 'Late delivery']:.1f}%)")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sns.heatmap(cross, annot=True, fmt=".1f", cmap="Reds", ax=ax, cbar_kws={"label": "% of orders"})
+    ax.set_title("Delivery Status Mix by Shipping Mode (%)")
+    fig.tight_layout()
+    save(fig, figures_dir, "mode_status_heatmap.png")
+
+
+def analyze_segment_bubble(df: pd.DataFrame, figures_dir: str) -> None:
+    sales_col = first_present(df, ["Sales", "Order Item Total"])
+    profit_col = first_present(df, ["Order Profit Per Order", "Benefit per order"])
+    if "Customer Segment" not in df.columns or not sales_col or not profit_col:
+        print("Skipping customer segment bubble chart: required columns not found.")
+        return
+
+    grouped = df.groupby("Customer Segment").agg(
+        total_sales=(sales_col, "sum"),
+        total_profit=(profit_col, "sum"),
+        order_count=(sales_col, "size"),
+    )
+    grouped["margin_pct"] = grouped["total_profit"] / grouped["total_sales"] * 100
+    if "Late_delivery_risk" in df.columns:
+        grouped["late_rate"] = df.groupby("Customer Segment")["Late_delivery_risk"].mean()
+    else:
+        grouped["late_rate"] = 0.0
+
+    print("\n=== Q6: Which customer segment is most profitable, and at what delivery-risk cost? ===")
+    for seg, row in grouped.iterrows():
+        print(
+            f"  {seg}: margin {row['margin_pct']:.1f}%, {row['order_count']:,} orders, "
+            f"late rate {row['late_rate'] * 100:.1f}%"
+        )
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sizes = grouped["order_count"] / grouped["order_count"].max() * 3000
+    scatter = ax.scatter(
+        grouped["total_sales"], grouped["margin_pct"], s=sizes,
+        c=grouped["late_rate"], cmap="RdYlGn_r", alpha=0.8, edgecolors="black",
+    )
+    for seg, row in grouped.iterrows():
+        ax.annotate(seg, (row["total_sales"], row["margin_pct"]), textcoords="offset points", xytext=(5, 5))
+    fig.colorbar(scatter, ax=ax, label="Late delivery rate")
+    ax.set_xlabel("Total Sales ($)")
+    ax.set_ylabel("Margin (%)")
+    ax.set_title("Customer Segment: Sales vs Margin (bubble size = order count)")
+    fig.tight_layout()
+    save(fig, figures_dir, "segment_bubble_chart.png")
+
+
+def analyze_regional_choropleth(df: pd.DataFrame, figures_dir: str) -> None:
+    sales_col = first_present(df, ["Sales", "Order Item Total"])
+    if "Order Country" not in df.columns or not sales_col:
+        print("Skipping regional choropleth map: required columns not found.")
+        return
+
+    country_sales = df.groupby("Order Country")[sales_col].sum().reset_index()
+    top_country = country_sales.loc[country_sales[sales_col].idxmax(), "Order Country"]
+
+    print("\n=== Q7: Which countries/regions generate the most sales? ===")
+    print(f"  Top country by total sales: {top_country}")
+
+    fig = px.choropleth(
+        country_sales,
+        locations="Order Country",
+        locationmode="country names",
+        color=sales_col,
+        color_continuous_scale="Blues",
+        title="Total Sales by Country",
+    )
+    out_path = os.path.join(figures_dir, "regional_sales_choropleth.html")
+    fig.write_html(out_path)
+    print(f"  Saved interactive map: {out_path}")
+    try:
+        fig.write_image(os.path.join(figures_dir, "regional_sales_choropleth.png"))
+    except Exception:
+        print("  (Install 'kaleido' to also export this map as a static PNG: pip install -U kaleido)")
+
+
+def analyze_sales_trend(df: pd.DataFrame, figures_dir: str) -> None:
+    date_col = "order date (DateOrders)"
+    sales_col = first_present(df, ["Sales", "Order Item Total"])
+    profit_col = first_present(df, ["Order Profit Per Order", "Benefit per order"])
+    if date_col not in df.columns or not sales_col or not profit_col:
+        print("Skipping sales trend analysis: required columns not found.")
+        return
+    if not pd.api.types.is_datetime64_any_dtype(df[date_col]):
+        print(
+            f"Skipping sales trend analysis: '{date_col}' isn't parsed as a date "
+            f"(run it through clean() first)."
+        )
+        return
+
+    monthly = df.set_index(date_col).resample("MS")[[sales_col, profit_col]].sum()
+    best_month = monthly[sales_col].idxmax()
+
+    print("\n=== Q8: Is revenue/profit growing, flat, or declining over time? ===")
+    print(f"  Best sales month: {best_month:%Y-%m} (${monthly.loc[best_month, sales_col]:,.0f})")
+
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+    ax1.plot(monthly.index, monthly[sales_col], color="steelblue", label="Sales")
+    ax1.set_ylabel("Sales ($)", color="steelblue")
+    ax2 = ax1.twinx()
+    ax2.plot(monthly.index, monthly[profit_col], color="darkorange", label="Profit")
+    ax2.set_ylabel("Profit ($)", color="darkorange")
+    ax1.set_title("Monthly Sales and Profit Trend")
+    fig.tight_layout()
+    save(fig, figures_dir, "sales_profit_trend.png")
+
+
+def analyze_negative_profit_orders(df: pd.DataFrame, figures_dir: str) -> None:
+    profit_col = first_present(df, ["Order Profit Per Order", "Benefit per order"])
+    if not profit_col or "Category Name" not in df.columns:
+        print("Skipping negative-profit analysis: required columns not found.")
+        return
+
+    negative = df[df[profit_col] < 0]
+    share = len(negative) / len(df) * 100
+
+    print("\n=== Q9: Where are the loss-making orders concentrated? ===")
+    print(f"  {len(negative):,} orders ({share:.1f}%) have negative profit.")
+
+    by_category = negative.groupby("Category Name").size().sort_values(ascending=False).head(10)
+    if by_category.empty:
+        print("  No loss-making orders found.")
+        return
+    print(f"  Top category for losses: {by_category.index[0]} ({by_category.iloc[0]:,} loss-making orders)")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    by_category.sort_values().plot(kind="barh", ax=ax, color="firebrick")
+    ax.set_xlabel("Number of Loss-Making Orders")
+    ax.set_title("Top 10 Categories by Count of Loss-Making Orders")
+    fig.tight_layout()
+    save(fig, figures_dir, "negative_profit_by_category.png")
+
+
+def main() -> None:
+    df = get_cleaned_data()
+
+    figures_dir = "figures"
+    os.makedirs(figures_dir, exist_ok=True)
+
+    analyze_late_delivery_rate(df, figures_dir)
+    analyze_shipping_delay(df, figures_dir)
+    analyze_category_profitability(df, figures_dir)
+    analyze_discount_vs_profit(df, figures_dir)
+    analyze_mode_status_heatmap(df, figures_dir)
+    analyze_segment_bubble(df, figures_dir)
+    analyze_regional_choropleth(df, figures_dir)
+    analyze_sales_trend(df, figures_dir)
+    analyze_negative_profit_orders(df, figures_dir)
+
+    print(f"\nDone. All charts saved to '{figures_dir}/'.")
+
+
+if __name__ == "__main__":
+    main()
