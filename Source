@@ -1,11 +1,3 @@
-# dataco_full.py
-#
-# Purpose: End-to-end pipeline for the "DataCo Smart Supply Chain for Big
-# Data Analysis" dataset (Kaggle). Downloads the raw data via kagglehub,
-# loads it into a pandas DataFrame, runs a first-pass data-quality
-# inspection, cleans it, exports a cleaned CSV, and then answers the key
-# shareholder-facing questions with one chart per question.
-#
 # Dataset source:
 # https://www.kaggle.com/datasets/shashwatwork/dataco-smart-supply-chain-for-big-data-analysis
 #
@@ -13,21 +5,18 @@
 #   pip install pandas numpy matplotlib seaborn plotly kagglehub
 #   pip install -U kaleido   # optional, only needed to export the map as a static PNG
 #
-# You'll also need a Kaggle account with API credentials configured
+# Note:You'll also need a Kaggle account with API credentials configured
 # (~/.kaggle/kaggle.json), or kagglehub will prompt you to authenticate
 # the first time you run this.
 #
 # Known quirks of the raw file this script accounts for:
-#   1. The file is encoded in Latin-1 (ISO-8859-1), NOT UTF-8. Reading it
+#   1. The file is encoded in Latin-1 not UTF-8. Reading it
 #      as UTF-8 will throw a UnicodeDecodeError or silently mangle accented
 #      characters in product/customer name fields.
-#   2. Several columns contain missing values: Customer Lname,
-#      Customer Zipcode, Order Zipcode, Product Description.
-#   3. Date columns are strings like "1/31/2018 22:56" (M/D/YYYY H:MM),
-#      not proper datetime objects until you parse them.
+#   2. The data isn't cleaned and dates have to be proecessed into dateime64 values
 #
 # Cleaning rules applied:
-#   1. Text/categorical missing values (Customer Lname, Product Description,
+#   1. Text/categorical missing values (Customer Name, Product Description,
 #      etc.) are left as NaN -- not filled with a placeholder.
 #   2. Missing numeric values are left as NaN -- never imputed with 0 or a
 #      mean -- so they don't silently skew averages/sums downstream.
@@ -43,22 +32,23 @@
 #
 # Questions answered (one analysis function per question):
 #   1. Which shipping mode / region / market has the highest late-delivery
-#      rate?                                   -> bar chart
+#      rate? (bar chart)
 #   2. Which shipping mode takes longer than scheduled, on average?
-#                                                -> grouped bar chart
+#      (grouped bar chart)
 #   3. Which category drives the most profit vs. the most revenue?
-#                                                -> ranked horizontal bar chart
-#   4. Are discounts eroding profit?             -> scatter plot + trendline
+#      (ranked horizontal bar chart)
+#   4. Are discounts eroding profit? 
+#      (scatter plot and trendline)
 #   5. Which shipping mode has the worst delivery-status mix?
-#                                                -> heatmap
+#      (heatmap)
 #   6. Which customer segment is most profitable, and at what
-#      delivery-risk cost?                       -> bubble chart
-#   7. Which countries/regions generate the most sales?
-#                                                -> choropleth map (plotly)
+#      delivery-risk cost?(bubble chart)
+#   7. Which countries/regions generate the most sales? 
+#      (choropleth map (plotly))
 #   8. Is revenue/profit growing, flat, or declining over time?
-#                                                -> dual-axis time series
+#      (dual-axis time series)
 #   9. Where are the loss-making orders concentrated?
-#                                                -> ranked horizontal bar chart
+#      (ranked horizontal bar chart)
 #
 # Run:
 #   python dataco_full.py
